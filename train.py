@@ -24,8 +24,8 @@ CONFIG = {
     "hidden_dim": STUDENT_DIM,
     "T_max": 3,
     "batch_size": 1,
-    "learning_rate": 2e-5,
-    "num_epochs": 80,
+    "learning_rate": 1e-4,
+    "num_epochs": 100,
     "lambda_vf": 0.00005,
     "lambda_lya": 0.005,
     "lambda_jac": 0.0,
@@ -107,19 +107,19 @@ def compute_e2e_loss(student, tokenizer, thinking_block, batch, phi_x, student_t
             q_inputs["input_ids"]
         ).float()
 
-        # Compute thinking delta
-        thinking_delta = (h_T - phi_x_i).unsqueeze(1)
-        scale = original_embeds.norm(dim=-1, keepdim=True).mean()
-        thinking_delta = thinking_delta * (
-            scale / (thinking_delta.norm() + 1e-8)
-        ) * 0.01
+        # Scale thinking token to 1% of embedding magnitude
+        thinking_token = h_T.unsqueeze(1).to(student.dtype)
+        orig = original_embeds.to(student.dtype)
+        embed_norm = orig.norm(dim=-1).mean()
+        think_norm = thinking_token.norm(dim=-1).mean()
+        thinking_token = thinking_token * (embed_norm / (think_norm + 1e-8)) * 0.01
 
-        # Inject into last token
-        modified_embeds = original_embeds.clone()
-        modified_embeds[:, -1:, :] = (
-            original_embeds[:, -1:, :] + thinking_delta
-        )
-        modified_embeds = modified_embeds.to(student.dtype)
+        # Prepend thinking token
+        extended_embeds = torch.cat([thinking_token, orig], dim=1)
+        extended_mask = torch.cat([
+            torch.ones(1, 1, device=device, dtype=q_inputs["attention_mask"].dtype),
+            q_inputs["attention_mask"]
+        ], dim=1)
 
         # Tokenize answer
         ans_ids = tokenizer(
@@ -129,17 +129,18 @@ def compute_e2e_loss(student, tokenizer, thinking_block, batch, phi_x, student_t
             max_length=8
         )["input_ids"].to(device)
 
-        # Forward pass through student with modified embeds
-        # This keeps gradient connection to thinking_block
+        # Forward pass with prepended token
         outputs = student(
-            inputs_embeds=modified_embeds,
-            attention_mask=q_inputs["attention_mask"],
+            inputs_embeds=extended_embeds,
+            attention_mask=extended_mask,
             output_hidden_states=False
         )
 
-        # Cross entropy on last logit vs answer first token
-        logits = outputs.logits[:, -1, :]  # (1, vocab)
-        target = ans_ids[:, 0]              # (1,)
+        # Cross entropy on position [seq_len] which is first generated position
+        # after the prepended thinking token + full input
+        seq_len = extended_embeds.shape[1]
+        logits = outputs.logits[:, seq_len-1, :]
+        target = ans_ids[:, 0]
 
         loss_i = torch.nn.functional.cross_entropy(logits, target)
         e2e_losses.append(loss_i)
@@ -219,7 +220,7 @@ def train_step(batch_idx, cache, student, tokenizer, thinking_block, halter, opt
     )
 
     total = combined_loss(
-        L_ans + 0.1 * L_e2e,
+        L_ans + 0.5 * L_e2e,
         L_vf,
         L_lya,
         torch.tensor(0.0).to(config["device"]),
