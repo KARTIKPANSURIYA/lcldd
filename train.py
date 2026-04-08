@@ -32,7 +32,9 @@ CONFIG = {
     "lambda_jac": 0.0,
     "stage": "E",
     "max_length": 128,
-    "device": "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    "device": "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
+    "phi_x_mode": "last_token_embed",
+    "injection_scale": 0.1
 }
 
 TRAIN_DATA = [
@@ -112,10 +114,10 @@ def compute_e2e_loss(student, tokenizer, thinking_block, proj_head, batch, phi_x
 
         delta = proj_head(h_T, phi_x_i).to(student.dtype)
 
-        # Scale delta to 1% of embedding magnitude
+        # Scale delta to embedding magnitude according to config
         embed_norm = orig.norm(dim=-1).mean()
         delta_norm = delta.norm(dim=-1).mean()
-        delta = delta * (embed_norm / (delta_norm + 1e-8)) * 0.01
+        delta = delta * (embed_norm / (delta_norm + 1e-8)) * config.get("injection_scale", 0.1)
 
         # Inject into LAST token (not prepend)
         modified_embeds = orig.clone()
@@ -175,7 +177,11 @@ def train_step(batch_idx, cache, student, tokenizer, thinking_block, proj_head, 
         student_outputs = student(
             **inputs, output_hidden_states=True
         )
-        phi_x = student_outputs.hidden_states[-1].mean(dim=1)
+        if config.get("phi_x_mode") == "last_token_embed":
+            phi_x = student.get_input_embeddings()(inputs["input_ids"]).float()[:, -1, :]
+        else:
+            phi_x = student_outputs.hidden_states[-1].mean(dim=1).float()
+            
         phi_x = phi_x.detach().to(torch.float32)
 
     phi_x = phi_x.detach().requires_grad_(False)

@@ -56,7 +56,7 @@ def evaluate(model, tokenizer, thinking_block, proj_head, eval_data, use_thinkin
         if use_thinking:
             with torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True)
-                phi_x = outputs.hidden_states[-1].mean(dim=1).float()
+                phi_x = model.get_input_embeddings()(inputs["input_ids"]).float()[:, -1, :]
 
                 h = phi_x.clone()
                 for _ in range(T_max):
@@ -72,7 +72,7 @@ def evaluate(model, tokenizer, thinking_block, proj_head, eval_data, use_thinkin
                 
                 embed_norm = orig.norm(dim=-1).mean()
                 delta_norm = delta.norm(dim=-1).mean()
-                delta = delta * (embed_norm / (delta_norm + 1e-8)) * 0.01
+                delta = delta * (embed_norm / (delta_norm + 1e-8)) * 0.1
 
                 modified_embeds = orig.clone()
                 modified_embeds[:, -1:, :] = orig[:, -1:, :] + delta.unsqueeze(1)
