@@ -9,7 +9,7 @@ import re
 os.environ["HF_HUB_DISABLE_XET"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 CONFIG_HIDDEN_DIM = 1536
 
 # ── Eval set: 10 training-domain + 5 held-out test questions ────────────
