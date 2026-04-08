@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from models.thinking_block import LyapunovThinkingBlock
+from models.projection_head import ProjectionHead
 from models.halting import PhaseSpaceHalting
 from losses.lyapunov_loss import lyapunov_loss
 from losses.vf_loss import vector_field_loss
@@ -77,7 +78,7 @@ def load_student_only(config):
     return student, tokenizer
 
 
-def compute_e2e_loss(student, tokenizer, thinking_block, batch, phi_x, student_traj, config):
+def compute_e2e_loss(student, tokenizer, thinking_block, proj_head, batch, phi_x, student_traj, config):
     """
     Backpropagate answer cross-entropy through
     thinking block injection into embeddings.
@@ -107,19 +108,19 @@ def compute_e2e_loss(student, tokenizer, thinking_block, batch, phi_x, student_t
             q_inputs["input_ids"]
         ).float()
 
-        # Scale thinking token to 1% of embedding magnitude
-        thinking_token = h_T.unsqueeze(1).to(student.dtype)
         orig = original_embeds.to(student.dtype)
-        embed_norm = orig.norm(dim=-1).mean()
-        think_norm = thinking_token.norm(dim=-1).mean()
-        thinking_token = thinking_token * (embed_norm / (think_norm + 1e-8)) * 0.01
 
-        # Prepend thinking token
-        extended_embeds = torch.cat([thinking_token, orig], dim=1)
-        extended_mask = torch.cat([
-            torch.ones(1, 1, device=device, dtype=q_inputs["attention_mask"].dtype),
-            q_inputs["attention_mask"]
-        ], dim=1)
+        delta = proj_head(h_T, phi_x_i).to(student.dtype)
+
+        # Scale delta to 1% of embedding magnitude
+        embed_norm = orig.norm(dim=-1).mean()
+        delta_norm = delta.norm(dim=-1).mean()
+        delta = delta * (embed_norm / (delta_norm + 1e-8)) * 0.01
+
+        # Inject into LAST token (not prepend)
+        modified_embeds = orig.clone()
+        modified_embeds[:, -1:, :] = orig[:, -1:, :] + delta.unsqueeze(1)
+        extended_mask = q_inputs["attention_mask"]
 
         # Tokenize answer
         ans_ids = tokenizer(
@@ -129,16 +130,15 @@ def compute_e2e_loss(student, tokenizer, thinking_block, batch, phi_x, student_t
             max_length=8
         )["input_ids"].to(device)
 
-        # Forward pass with prepended token
+        # Forward pass with injected token
         outputs = student(
-            inputs_embeds=extended_embeds,
+            inputs_embeds=modified_embeds,
             attention_mask=extended_mask,
             output_hidden_states=False
         )
 
         # Cross entropy on position [seq_len] which is first generated position
-        # after the prepended thinking token + full input
-        seq_len = extended_embeds.shape[1]
+        seq_len = modified_embeds.shape[1]
         logits = outputs.logits[:, seq_len-1, :]
         target = ans_ids[:, 0]
 
@@ -148,7 +148,7 @@ def compute_e2e_loss(student, tokenizer, thinking_block, batch, phi_x, student_t
     return torch.stack(e2e_losses).mean()
 
 
-def train_step(batch_idx, cache, student, tokenizer, thinking_block, halter, optimizer, config, step):
+def train_step(batch_idx, cache, student, tokenizer, thinking_block, proj_head, halter, optimizer, config, step):
     batch = [TRAIN_DATA[j] for j in batch_idx]
     inputs = tokenizer(
         [item["question"] for item in batch],
@@ -215,7 +215,7 @@ def train_step(batch_idx, cache, student, tokenizer, thinking_block, halter, opt
     L_lya = L_lya / config["hidden_dim"]
 
     L_e2e = compute_e2e_loss(
-        student, tokenizer, thinking_block,
+        student, tokenizer, thinking_block, proj_head,
         batch, phi_x, student_traj, config
     )
 
@@ -233,7 +233,7 @@ def train_step(batch_idx, cache, student, tokenizer, thinking_block, halter, opt
     optimizer.zero_grad()
     total.backward()
     torch.nn.utils.clip_grad_norm_(
-        thinking_block.parameters(),
+        list(thinking_block.parameters()) + list(proj_head.parameters()),
         max_norm=0.1
     )
     optimizer.step()
@@ -262,11 +262,12 @@ if __name__ == "__main__":
     proj = proj.to(CONFIG["device"])
 
     thinking_block = LyapunovThinkingBlock(CONFIG["hidden_dim"]).to(CONFIG["device"])
+    proj_head = ProjectionHead(CONFIG["hidden_dim"]).to(CONFIG["device"])
     halter = PhaseSpaceHalting().to(CONFIG["device"])
 
-    # Optimizer trains ONLY the thinking block now (projection is fixed)
+    # Optimizer trains thinking block and projection head
     optimizer = torch.optim.AdamW(
-        thinking_block.parameters(),
+        list(thinking_block.parameters()) + list(proj_head.parameters()),
         lr=CONFIG["learning_rate"]
     )
 
@@ -274,6 +275,8 @@ if __name__ == "__main__":
     if os.path.exists(RESUME_FROM):
         ckpt = torch.load(RESUME_FROM, map_location=CONFIG["device"])
         thinking_block.load_state_dict(ckpt["thinking_block_state"])
+        if "proj_head_state" in ckpt:
+            proj_head.load_state_dict(ckpt["proj_head_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
         print(f"Resuming from {RESUME_FROM}")
     else:
@@ -295,7 +298,7 @@ if __name__ == "__main__":
         for step, i in enumerate(range(0, len(TRAIN_DATA), CONFIG["batch_size"])):
             batch_idx = list(range(i, min(i + CONFIG["batch_size"], len(TRAIN_DATA))))
             losses = train_step(
-                batch_idx, cache, student, tokenizer, thinking_block, halter, optimizer, CONFIG, step
+                batch_idx, cache, student, tokenizer, thinking_block, proj_head, halter, optimizer, CONFIG, step
             )
 
             if first_lya is None:
@@ -327,6 +330,7 @@ if __name__ == "__main__":
             torch.save({
                 "epoch": start_epoch + epoch,
                 "thinking_block_state": thinking_block.state_dict(),
+                "proj_head_state": proj_head.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "losses": losses,
             }, ckpt_path)
@@ -350,6 +354,7 @@ if __name__ == "__main__":
         torch.save({
             "epoch": CONFIG["num_epochs"],
             "thinking_block_state": thinking_block.state_dict(),
+            "proj_head_state": proj_head.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "config": CONFIG,
             "final_losses": {

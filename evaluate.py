@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from models.thinking_block import LyapunovThinkingBlock
+from models.projection_head import ProjectionHead
 import os
 import re
 
@@ -33,7 +34,7 @@ GSM8K_EVAL = [
 ]
 
 
-def evaluate(model, tokenizer, thinking_block, eval_data, use_thinking=True):
+def evaluate(model, tokenizer, thinking_block, proj_head, eval_data, use_thinking=True):
     correct = 0
     total = len(eval_data)
     results = []
@@ -65,17 +66,16 @@ def evaluate(model, tokenizer, thinking_block, eval_data, use_thinking=True):
                     inputs["input_ids"]
                 ).float()
 
-                thinking_delta = (h - phi_x).unsqueeze(1)
-                scale = original_embeds.norm(dim=-1, keepdim=True).mean()
-                thinking_delta = thinking_delta * (
-                    scale / (thinking_delta.norm() + 1e-8)
-                )
+                orig = original_embeds.to(model.dtype)
+                
+                delta = proj_head(h, phi_x).to(model.dtype)
+                
+                embed_norm = orig.norm(dim=-1).mean()
+                delta_norm = delta.norm(dim=-1).mean()
+                delta = delta * (embed_norm / (delta_norm + 1e-8)) * 0.01
 
-                modified_embeds = original_embeds.clone()
-                modified_embeds[:, -1:, :] = (
-                    original_embeds[:, -1:, :] + 0.01 * thinking_delta
-                )
-                modified_embeds = modified_embeds.to(model.dtype)
+                modified_embeds = orig.clone()
+                modified_embeds[:, -1:, :] = orig[:, -1:, :] + delta.unsqueeze(1)
 
                 generated = model.generate(
                     inputs_embeds=modified_embeds,
@@ -138,11 +138,14 @@ if __name__ == "__main__":
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading thinking block from checkpoint...")
+    print("Loading thinking block and projection head from checkpoint...")
     thinking_block = LyapunovThinkingBlock(CONFIG_HIDDEN_DIM).to(DEVICE)
+    proj_head = ProjectionHead(CONFIG_HIDDEN_DIM).to(DEVICE)
     if os.path.exists(CHECKPOINT):
         ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
         thinking_block.load_state_dict(ckpt["thinking_block_state"])
+        if "proj_head_state" in ckpt:
+            proj_head.load_state_dict(ckpt["proj_head_state"])
         print(f"Loaded from {CHECKPOINT}")
         if "final_losses" in ckpt:
             print(f"  Checkpoint L_lya: {ckpt['final_losses']['L_lya']:.4f}")
@@ -151,10 +154,10 @@ if __name__ == "__main__":
         print(f"WARNING: {CHECKPOINT} not found — using fresh (untrained) thinking block")
 
     print("\n--- Running BASELINE (no thinking block) ---")
-    baseline = evaluate(student, tokenizer, thinking_block, GSM8K_EVAL, use_thinking=False)
+    baseline = evaluate(student, tokenizer, thinking_block, proj_head, GSM8K_EVAL, use_thinking=False)
 
     print("\n--- Running LCLDD (with thinking block injection) ---")
-    lcldd = evaluate(student, tokenizer, thinking_block, GSM8K_EVAL, use_thinking=True)
+    lcldd = evaluate(student, tokenizer, thinking_block, proj_head, GSM8K_EVAL, use_thinking=True)
 
     print("\n" + "=" * 60)
     print("COMPARISON")
