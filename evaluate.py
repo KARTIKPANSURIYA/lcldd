@@ -74,6 +74,7 @@ def run_lcldd(model, tokenizer, question: str, thinking_block, proj_head, device
     energy_steps = []
     latent_norm_steps = []
     delta_steps = []
+    start = time.perf_counter()
 
     with torch.no_grad():
         phi_x = model.get_input_embeddings()(inputs["input_ids"]).float()[:, -1, :]
@@ -83,23 +84,22 @@ def run_lcldd(model, tokenizer, question: str, thinking_block, proj_head, device
         latent_norm_steps.append(h.norm(dim=-1).mean().item())
 
         for _ in range(CONFIG["T_max"]):
+            h_prev = h
             h = thinking_block(h, phi_x)
             energy_steps.append(thinking_block.lyapunov_energy(h, phi_x).mean().item())
             latent_norm_steps.append(h.norm(dim=-1).mean().item())
+            delta_steps.append((h - h_prev).norm(dim=-1).mean().item())
 
         delta = proj_head(h, phi_x)
-        delta_steps.append(delta.norm(dim=-1).mean().item())
 
         original_embeds = model.get_input_embeddings()(inputs["input_ids"]).float()
         embed_norm = original_embeds[:, -1, :].norm(dim=-1, keepdim=True)
         delta_norm = delta.norm(dim=-1, keepdim=True)
         delta = delta * (embed_norm / (delta_norm + 1e-8)) * CONFIG["injection_scale"]
-        delta_steps.append(delta.norm(dim=-1).mean().item())
 
         modified_embeds = original_embeds.clone()
         modified_embeds[:, -1, :] = modified_embeds[:, -1, :] + delta
 
-        start = time.perf_counter()
         generated = model.generate(
             inputs_embeds=modified_embeds.to(model.dtype),
             attention_mask=inputs["attention_mask"],
@@ -107,7 +107,7 @@ def run_lcldd(model, tokenizer, question: str, thinking_block, proj_head, device
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
-        latency_ms = (time.perf_counter() - start) * 1000.0
+    latency_ms = (time.perf_counter() - start) * 1000.0
 
     energy_descending = all(
         energy_steps[i] >= energy_steps[i + 1] for i in range(len(energy_steps) - 1)
