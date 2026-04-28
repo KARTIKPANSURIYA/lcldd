@@ -1,0 +1,12 @@
+torch
+transformers
+datasets
+evaluate
+accelerate
+safetensors
+sentencepiece
+protobuf
+numpy
+pandas
+tqdm
+wandb
