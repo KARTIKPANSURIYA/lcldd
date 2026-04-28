@@ -1,173 +1,236 @@
-import torch
-import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from models.thinking_block import LyapunovThinkingBlock
-from models.projection_head import ProjectionHead
+import json
 import os
+import random
 import re
+import time
+from typing import Optional
 
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-CONFIG_HIDDEN_DIM = 1536
-
-# ── Eval set: 10 training-domain + 5 held-out test questions ────────────
-GSM8K_EVAL = [
-    # --- seen during training (distribution match) ---
-    {"question": "A farmer has 3 fields. Each field has 4 rows. Each row has 6 plants. How many plants total? Answer:", "answer": "72"},
-    {"question": "Lisa had 120 dollars. She spent a third on books and half of what remained on food. How much left? Answer:", "answer": "40"},
-    {"question": "A school has 8 classes. Each class has 25 students. 15 are absent. How many present? Answer:", "answer": "185"},
-    {"question": "John walks 3 miles to school and back every day for 5 days. Total miles? Answer:", "answer": "30"},
-    {"question": "A baker makes 12 loaves per hour. Works 6 hours and sells 40 loaves. How many remain? Answer:", "answer": "32"},
-    {"question": "There are 5 boxes with 8 red balls and 4 blue balls each. Total balls? Answer:", "answer": "60"},
-    {"question": "Maria has 3 times as many stickers as Tom. Tom has 24. Maria gives away 15. How many does Maria have? Answer:", "answer": "57"},
-    {"question": "A store buys apples for 2 dollars each and sells for 3 dollars. Sells 48 apples. What is the profit? Answer:", "answer": "48"},
-    {"question": "A tank holds 200 liters. It is 35 percent full. How many liters needed to fill it? Answer:", "answer": "130"},
-    {"question": "A train goes 60 mph for 2 hours then 80 mph for 1 hour. Total distance? Answer:", "answer": "200"},
-    # --- held-out test questions (not seen during training) ---
-    {"question": "A cinema has 15 rows with 20 seats each. 47 seats are occupied. How many are empty? Answer:", "answer": "253"},
-    {"question": "A worker earns 18 dollars per hour and works 7.5 hours. How much does he earn? Answer:", "answer": "135"},
-    {"question": "A container has 3.5 liters of juice. If 750ml is poured out, how many ml remain? Answer:", "answer": "2750"},
-    {"question": "A class of 30 students took a test. 40 percent passed. How many failed? Answer:", "answer": "18"},
-    {"question": "A recipe needs 2.5 cups of flour per batch. How much flour for 4 batches? Answer:", "answer": "10"},
-]
+from config import CONFIG
+from data.gsm8k_loader import load_gsm8k
+from models.projection_head import ProjectionHead
+from models.thinking_block import LyapunovThinkingBlock
 
 
-def evaluate(model, tokenizer, thinking_block, proj_head, eval_data, use_thinking=True):
-    correct = 0
-    total = len(eval_data)
-    results = []
-    T_max = 5
-    device = next(model.parameters()).device
+_NUMBER_PATTERN = re.compile(r"[-+]?\d*\.?\d+")
 
-    thinking_block.eval()
 
-    for item in eval_data:
-        inputs = tokenizer(
-            item["question"],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=128,
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def normalize_answer(x: str) -> str:
+    text = (x or "").strip()
+    text = text.replace(",", "").replace("$", "")
+    text = re.sub(r"\s+", " ", text)
+    text = text.rstrip(".")
+    return text
+
+
+def extract_final_number(text: str) -> str:
+    cleaned = normalize_answer(text)
+    matches = _NUMBER_PATTERN.findall(cleaned)
+    if not matches:
+        return ""
+    return normalize_answer(matches[-1])
+
+
+def exact_match_numeric(prediction: str, gold: str) -> bool:
+    pred_n = normalize_answer(prediction)
+    gold_n = normalize_answer(gold)
+    return pred_n != "" and pred_n == gold_n
+
+
+def run_baseline(model, tokenizer, question: str, device: str) -> tuple[str, float]:
+    inputs = tokenizer(question, return_tensors="pt", truncation=True, max_length=CONFIG["max_length"])
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    start = time.perf_counter()
+    with torch.no_grad():
+        generated = model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=32,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        if use_thinking:
-            with torch.no_grad():
-                outputs = model(**inputs, output_hidden_states=True)
-                phi_x = model.get_input_embeddings()(inputs["input_ids"]).float()[:, -1, :]
-
-                h = phi_x.clone()
-                for _ in range(T_max):
-                    h = thinking_block(h, phi_x)
-
-                original_embeds = model.get_input_embeddings()(
-                    inputs["input_ids"]
-                ).float()
-
-                orig = original_embeds.to(model.dtype)
-                
-                delta = proj_head(h, phi_x).to(model.dtype)
-                
-                embed_norm = orig.norm(dim=-1).mean()
-                delta_norm = delta.norm(dim=-1).mean()
-                delta = delta * (embed_norm / (delta_norm + 1e-8)) * 0.1
-
-                modified_embeds = orig.clone()
-                modified_embeds[:, -1:, :] = orig[:, -1:, :] + delta.unsqueeze(1)
-
-                generated = model.generate(
-                    inputs_embeds=modified_embeds,
-                    attention_mask=inputs["attention_mask"],
-                    max_new_tokens=15,
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-        else:
-            with torch.no_grad():
-                generated = model.generate(
-                    inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_new_tokens=15,
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-
-        decoded = tokenizer.decode(generated[0], skip_special_tokens=True).strip()
-
-        numbers_in_output = re.findall(r'\b\d+(?:\.\d+)?\b', decoded)
-        match = item["answer"] in numbers_in_output
-        if match:
-            correct += 1
-
-        results.append({
-            "question": item["question"],
-            "expected": item["answer"],
-            "predicted": decoded[:50],
-            "correct": match,
-        })
-
-    print("=" * 60)
-    print("LCLDD Evaluation Results")
-    print(f"Mode: {'With Thinking Block' if use_thinking else 'Baseline'}")
-    print("=" * 60)
-    for result in results:
-        status = "✅" if result["correct"] else "❌"
-        print(f"{status} Expected: {result['expected']:>6} | "
-              f"Got: {result['predicted'][:40]}")
-    print("=" * 60)
-    print(f"Accuracy: {correct}/{total} = {correct / total * 100:.1f}%")
-    print("=" * 60)
-    return correct / total
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    output = tokenizer.decode(generated[0], skip_special_tokens=True)
+    return output, latency_ms
 
 
-if __name__ == "__main__":
-    STUDENT_MODEL = "Qwen/Qwen2.5-1.5B"
-    CHECKPOINT = "checkpoints/lcldd_final.pt"
+def run_lcldd(model, tokenizer, question: str, thinking_block, proj_head, device: str):
+    inputs = tokenizer(question, return_tensors="pt", truncation=True, max_length=CONFIG["max_length"])
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    print("Loading student model (Qwen2.5-1.5B)...")
-    student = AutoModelForCausalLM.from_pretrained(
-        STUDENT_MODEL,
-        dtype=torch.float32,
-        output_hidden_states=True,
-        low_cpu_mem_usage=True,
-    ).to(DEVICE)
+    energy_steps = []
+    latent_norm_steps = []
+    delta_steps = []
+    start = time.perf_counter()
 
-    tokenizer = AutoTokenizer.from_pretrained(STUDENT_MODEL)
+    with torch.no_grad():
+        phi_x = model.get_input_embeddings()(inputs["input_ids"]).float()[:, -1, :]
+
+        h = phi_x.clone()
+        energy_steps.append(thinking_block.lyapunov_energy(h, phi_x).mean().item())
+        latent_norm_steps.append(h.norm(dim=-1).mean().item())
+
+        for _ in range(CONFIG["T_max"]):
+            h_prev = h
+            h = thinking_block(h, phi_x)
+            energy_steps.append(thinking_block.lyapunov_energy(h, phi_x).mean().item())
+            latent_norm_steps.append(h.norm(dim=-1).mean().item())
+            delta_steps.append((h - h_prev).norm(dim=-1).mean().item())
+
+        delta = proj_head(h, phi_x)
+
+        original_embeds = model.get_input_embeddings()(inputs["input_ids"]).float()
+        embed_norm = original_embeds[:, -1, :].norm(dim=-1, keepdim=True)
+        delta_norm = delta.norm(dim=-1, keepdim=True)
+        delta = delta * (embed_norm / (delta_norm + 1e-8)) * CONFIG["injection_scale"]
+
+        modified_embeds = original_embeds.clone()
+        modified_embeds[:, -1, :] = modified_embeds[:, -1, :] + delta
+
+        generated = model.generate(
+            inputs_embeds=modified_embeds.to(model.dtype),
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=32,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    latency_ms = (time.perf_counter() - start) * 1000.0
+
+    energy_descending = all(
+        energy_steps[i] >= energy_steps[i + 1] for i in range(len(energy_steps) - 1)
+    )
+
+    output = tokenizer.decode(generated[0], skip_special_tokens=True)
+    return output, latency_ms, energy_steps, latent_norm_steps, delta_steps, energy_descending
+
+
+def append_result(rows, i: int, mode: str, question: str, gold: str, raw_output: str, latency_ms: float,
+                  thinking_steps: int, energy_descending: Optional[bool], energy_steps, latent_norm_steps, delta_steps):
+    prediction = extract_final_number(raw_output)
+    rows.append(
+        {
+            "id": i,
+            "mode": mode,
+            "question": question,
+            "gold": normalize_answer(gold),
+            "prediction": prediction,
+            "raw_output": raw_output,
+            "correct": exact_match_numeric(prediction, gold),
+            "latency_ms": latency_ms,
+            "thinking_steps": thinking_steps,
+            "energy_descending": energy_descending,
+            "energy_steps": json.dumps(energy_steps) if energy_steps is not None else None,
+            "latent_norm_steps": json.dumps(latent_norm_steps) if latent_norm_steps is not None else None,
+            "delta_steps": json.dumps(delta_steps) if delta_steps is not None else None,
+        }
+    )
+
+
+def main() -> None:
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    set_seed(CONFIG["seed"])
+
+    device = CONFIG["device"]
+    os.makedirs(CONFIG["results_dir"], exist_ok=True)
+
+    eval_data = load_gsm8k(split=CONFIG["eval_split"], limit=CONFIG["eval_limit"])
+    print(f"Loaded {len(eval_data)} evaluation samples")
+
+    tokenizer = AutoTokenizer.from_pretrained(CONFIG["student_model"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading thinking block and projection head from checkpoint...")
-    thinking_block = LyapunovThinkingBlock(CONFIG_HIDDEN_DIM).to(DEVICE)
-    proj_head = ProjectionHead(CONFIG_HIDDEN_DIM).to(DEVICE)
-    if os.path.exists(CHECKPOINT):
-        ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
+    student = AutoModelForCausalLM.from_pretrained(
+        CONFIG["student_model"],
+        torch_dtype=torch.float32,
+        output_hidden_states=True,
+        low_cpu_mem_usage=True,
+    ).to(device)
+    student.eval()
+
+    thinking_block = LyapunovThinkingBlock(CONFIG["student_hidden_dim"]).to(device)
+    proj_head = ProjectionHead(CONFIG["student_hidden_dim"]).to(device)
+
+    if os.path.exists(CONFIG["final_checkpoint"]):
+        ckpt = torch.load(CONFIG["final_checkpoint"], map_location=device)
         thinking_block.load_state_dict(ckpt["thinking_block_state"])
-        if "proj_head_state" in ckpt:
-            proj_head.load_state_dict(ckpt["proj_head_state"])
-        print(f"Loaded from {CHECKPOINT}")
-        if "final_losses" in ckpt:
-            print(f"  Checkpoint L_lya: {ckpt['final_losses']['L_lya']:.4f}")
-            print(f"  Checkpoint L_vf:  {ckpt['final_losses']['L_vf']:.4f}")
+        proj_head.load_state_dict(ckpt["proj_head_state"])
+        print(f"Loaded LCLDD checkpoint: {CONFIG['final_checkpoint']}")
     else:
-        print(f"WARNING: {CHECKPOINT} not found — using fresh (untrained) thinking block")
+        print(f"Checkpoint not found: {CONFIG['final_checkpoint']} (running with untrained LCLDD modules)")
 
-    print("\n--- Running BASELINE (no thinking block) ---")
-    baseline = evaluate(student, tokenizer, thinking_block, proj_head, GSM8K_EVAL, use_thinking=False)
+    rows = []
+    for i, sample in enumerate(eval_data):
+        raw_b, lat_b = run_baseline(student, tokenizer, sample["question"], device)
+        append_result(
+            rows,
+            i,
+            "baseline",
+            sample["question"],
+            sample["answer"],
+            raw_b,
+            lat_b,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
 
-    print("\n--- Running LCLDD (with thinking block injection) ---")
-    lcldd = evaluate(student, tokenizer, thinking_block, proj_head, GSM8K_EVAL, use_thinking=True)
+        raw_l, lat_l, energy, latent_norms, deltas, descending = run_lcldd(
+            student, tokenizer, sample["question"], thinking_block, proj_head, device
+        )
+        append_result(
+            rows,
+            i,
+            "lcldd",
+            sample["question"],
+            sample["answer"],
+            raw_l,
+            lat_l,
+            CONFIG["T_max"],
+            descending,
+            energy,
+            latent_norms,
+            deltas,
+        )
 
-    print("\n" + "=" * 60)
-    print("COMPARISON")
-    print("=" * 60)
-    print(f"Baseline accuracy:  {baseline * 100:.1f}%")
-    print(f"LCLDD accuracy:     {lcldd * 100:.1f}%")
-    if lcldd > baseline:
-        print(f"LCLDD improvement:  +{(lcldd - baseline) * 100:.1f}% ✅")
-    elif lcldd == baseline:
-        print("Same accuracy — thinking block neutral")
-    else:
-        print(f"LCLDD regression:   -{(baseline - lcldd) * 100:.1f}% (more training needed)")
-    print("=" * 60)
+    pred_df = pd.DataFrame(rows)
+    summary_df = (
+        pred_df.groupby("mode", as_index=False)
+        .agg(correct=("correct", "sum"), total=("correct", "count"), avg_latency_ms=("latency_ms", "mean"))
+    )
+    summary_df["accuracy"] = summary_df["correct"] / summary_df["total"]
+    summary_df = summary_df[["mode", "correct", "total", "accuracy", "avg_latency_ms"]]
+
+    pred_csv = os.path.join(CONFIG["results_dir"], "gsm8k_predictions.csv")
+    pred_json = os.path.join(CONFIG["results_dir"], "gsm8k_predictions.json")
+    summary_csv = os.path.join(CONFIG["results_dir"], "gsm8k_summary.csv")
+
+    pred_df.to_csv(pred_csv, index=False)
+    pred_df.to_json(pred_json, orient="records", indent=2)
+    summary_df.to_csv(summary_csv, index=False)
+
+    print("\nFinal comparison table:")
+    print(summary_df.to_string(index=False))
+    print(f"\nSaved: {pred_csv}")
+    print(f"Saved: {pred_json}")
+    print(f"Saved: {summary_csv}")
+
+
+if __name__ == "__main__":
+    main()
