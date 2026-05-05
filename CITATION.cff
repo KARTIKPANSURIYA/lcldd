@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+title: "Mitigating Stochastic Drift in Small Language Models via Lyapunov-Constrained Latent Dynamics Distillation"
+message: "If you use this repository, please cite it using the metadata in this file."
+type: software
+authors:
+  - family-names: Pansuriya
+    given-names: Kartik
+  - family-names: Kharwa
+    given-names: Hena
+repository-code: "https://github.com/KARTIKPANSURIYA/lcldd"
+date-released: "2026-05-04"
+license: MIT
+keywords:
+  - small language models
+  - knowledge distillation
+  - latent reasoning
+  - Lyapunov stability
+  - GSM8K
