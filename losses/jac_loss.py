@@ -31,16 +31,6 @@ Caller responsibilities
 - `create_graph=True` here makes Stage F roughly 2x slower than Stage E,
   because gradient of the VJP must flow back through the thinking block
   parameters when we call backward on the total loss.
-
-Why not the original version
-----------------------------
-The old `jac_loss.py` called `torch.autograd.grad(h_T_teacher, x_embed,
-..., allow_unused=True)` on a teacher tensor loaded from a cache saved
-under `torch.no_grad()`.  Autograd returned `None` and the code silently
-replaced it with `torch.zeros_like(x_embed)`.  That makes the teacher
-Jacobian identically zero, so `L_jac = ||J_S - 0||^2` — which trains the
-student to be input-invariant.  This file fixes that by requiring
-precomputed, non-zero teacher VJPs.
 """
 import torch
 
