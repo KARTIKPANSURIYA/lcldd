@@ -1,73 +1,325 @@
-# LCLDD — Lyapunov-Constrained Latent Dynamics Distillation
+# LCLDD: Lyapunov-Constrained Latent Dynamics Distillation
 
-## 1. Overview
-LCLDD distills latent reasoning dynamics from a larger teacher model into a frozen student model through a trainable Lyapunov-constrained recursive thinking block and projection head. The repository keeps the original LCLDD concept intact (latent dynamics + Lyapunov energy constraints + injection at generation time), and now provides a reproducible GSM8K benchmark-oriented pipeline.
+**Mitigating stochastic drift in small language models through stable latent-space reasoning.**
 
-## 2. Current Benchmark Scope
-- **Dataset:** GSM8K only.
-- **Teacher:** `Qwen/Qwen2.5-3B-Instruct`.
-- **Student (frozen):** `Qwen/Qwen2.5-1.5B`.
+LCLDD is a research prototype for improving mathematical reasoning in frozen student language models. Instead of fine-tuning the full backbone or generating long chain-of-thought traces, LCLDD trains a lightweight recursive latent thinking block that modifies the prompt representation before answer generation.
 
-## 3. Pipeline
-`precompute_teacher.py` → `train.py` → `evaluate.py`
+The project was developed for GSM8K-style mathematical reasoning experiments and supports teacher trajectory precomputation, staged latent-module training, and baseline-vs-LCLDD evaluation.
 
-1. **precompute_teacher.py**
-   - Loads GSM8K train data.
-   - Extracts the teacher hidden-state trajectory (last 5 layers).
-   - Mean-pools and projects trajectory states to student hidden dimension.
-   - Saves cache to disk.
-2. **train.py**
-   - Loads cached teacher trajectories.
-   - Freezes full student model.
-   - Trains only the LCLDD modules (`LyapunovThinkingBlock`, `ProjectionHead`) using answer loss + vector-field + Lyapunov constraints.
-3. **evaluate.py**
-   - Evaluates **baseline** and **LCLDD-injected** generation modes on GSM8K test split.
-   - Computes numeric exact-match accuracy and latency.
-   - Writes benchmark artifacts.
+---
+
+## 1. Project Summary
+
+Small language models can be efficient to deploy, but they often struggle with multi-step reasoning. LCLDD addresses this by learning a controlled latent update:
+
+\[
+h_{t+1} = G_\theta(h_t, \phi(x))
+\]
+
+where \(\phi(x)\) is a question-conditioned semantic anchor and \(G_\theta\) is a trainable recursive thinking block. The final latent displacement is injected into the prompt embedding before greedy answer generation.
+
+The training objective combines:
+
+- **Answer supervision**: encourages the latent update to improve the final numeric answer.
+- **Vector-field distillation**: aligns the student's latent motion with a stronger teacher model.
+- **Lyapunov-style stability regularization**: discourages uncontrolled latent drift during recursive reasoning.
+
+---
+
+## 2. Main Experimental Results
+
+The main project experiments were run on the full **Grade School Math 8K (GSM8K)** test split with 1,319 examples.
+
+| Experiment | Baseline | LCLDD | Change |
+|---|---:|---:|---:|
+| Qwen2.5-7B on full GSM8K | 60 / 1319 = **4.55%** | 142 / 1319 = **10.77%** | **+6.22 pts** |
+| Qwen2.5-Math-7B on full GSM8K | 186 / 1319 = **14.10%** | 188 / 1319 = **14.25%** | **+0.15 pts** |
+| Qwen2.5-7B 500-example ablation, Stage E | 28 / 500 = **5.60%** | 53 / 500 = **10.60%** | **+5.00 pts** |
+
+### External 7B Reference Models
+
+| Model | Correct | Accuracy |
+|---|---:|---:|
+| Qwen2.5-7B baseline | 60 / 1319 | 4.55% |
+| Qwen2.5-7B-Instruct | 67 / 1319 | 5.08% |
+| Mistral-7B-v0.1 | 73 / 1319 | 5.53% |
+| Mistral-7B-Instruct-v0.3 | 30 / 1319 | 2.27% |
+| Qwen2.5-7B + LCLDD | 142 / 1319 | 10.77% |
+
+**Note:** External model comparisons use the same direct numeric-answer extraction format. Some instruction-tuned models may perform differently with model-specific chat templates.
+
+---
+
+## 3. Repository Structure
+
+```text
+.
+├── config.py                  # Central configuration for model, dataset, training, and paths
+├── precompute_teacher.py       # Precomputes teacher hidden-state trajectories
+├── train.py                    # Trains the LCLDD thinking block and projection head
+├── evaluate.py                 # Evaluates baseline and LCLDD generation on GSM8K
+├── data/
+│   └── gsm8k_loader.py         # GSM8K loading and numeric answer extraction
+├── losses/
+│   ├── combined_loss.py        # Stage-aware LCLDD loss composition
+│   ├── lyapunov_loss.py        # Lyapunov energy descent penalty
+│   └── vf_loss.py              # Vector-field distillation loss
+├── models/
+│   ├── thinking_block.py       # Contractive Lyapunov thinking block
+│   ├── projection_head.py      # Bounded projection head for latent injection
+│   └── halting.py              # Experimental dynamic halting module
+├── requirements.txt
+└── README.md
+```
+
+Generated files are intentionally ignored by Git:
+
+```text
+cache/
+checkpoints/
+results/
+wandb/
+```
+
+This keeps the repository lightweight and avoids committing large model caches or experiment outputs.
+
+---
 
 ## 4. Installation
+
+Create a fresh Python environment and install dependencies:
+
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-## 5. Quick Test Run
-Set these values in `config.py`:
-- `train_limit = 50`
-- `eval_limit = 50`
-- `num_epochs = 1`
+For GPU experiments, install a PyTorch build compatible with your CUDA version if the default installation does not match your environment.
 
-Then run:
+---
+
+## 5. Quick Start
+
+The default code path follows this pipeline:
+
 ```bash
 python precompute_teacher.py
 python train.py
 python evaluate.py
 ```
 
-## 6. GSM8K Benchmark Run
-Set these values in `config.py`:
-- `train_limit = 1000`
-- `eval_limit = None`
-- `num_epochs = 3`
+### Step 1: Precompute Teacher Trajectories
 
-Then run:
 ```bash
 python precompute_teacher.py
+```
+
+This script:
+
+1. Loads GSM8K training samples.
+2. Runs the teacher model once over the training subset.
+3. Extracts hidden states from selected upper layers.
+4. Projects teacher states into the student hidden dimension.
+5. Saves the result to `cache/gsm8k_teacher_train.pt`.
+
+### Step 2: Train LCLDD
+
+```bash
 python train.py
+```
+
+This script:
+
+1. Loads the cached teacher trajectory file.
+2. Freezes the full student language model.
+3. Trains only the LCLDD modules:
+   - `LyapunovThinkingBlock`
+   - `ProjectionHead`
+4. Saves checkpoints to `checkpoints/`.
+
+### Step 3: Evaluate
+
+```bash
 python evaluate.py
 ```
 
-## 7. Output Files
-- `cache/gsm8k_teacher_train.pt`
-- `checkpoints/gsm8k_lcldd_final.pt`
-- `results/gsm8k_predictions.csv`
-- `results/gsm8k_summary.csv`
+This script evaluates two modes:
 
-## 8. Metrics Reported
-- exact-match accuracy
-- average latency
-- thinking steps
-- Lyapunov energy descent
-- latent norm trajectory
+- `baseline`: direct frozen-student generation
+- `lcldd`: generation after latent displacement injection
 
-## 9. Safe Claim Template
-“On GSM8K, LCLDD achieved X% exact-match accuracy compared with Y% for the frozen Qwen2.5-1.5B baseline, while maintaining monotonic Lyapunov energy descent in Z% of evaluated samples.”
+It writes:
+
+```text
+results/gsm8k_predictions.csv
+results/gsm8k_predictions.json
+results/gsm8k_summary.csv
+```
+
+---
+
+## 6. Configuration
+
+Most settings are controlled in `config.py`.
+
+Important fields:
+
+| Field | Purpose |
+|---|---|
+| `teacher_model` | Hugging Face teacher model ID |
+| `student_model` | Hugging Face student model ID |
+| `teacher_hidden_dim` | Teacher hidden dimension before projection |
+| `student_hidden_dim` | Student hidden dimension |
+| `train_limit` | Number of GSM8K training examples for trajectory cache |
+| `eval_limit` | Number of GSM8K test examples; use `None` for full test |
+| `T_max` | Number of recursive latent thinking steps |
+| `injection_scale` | Strength of latent displacement injection |
+| `lambda_vf` | Weight for vector-field distillation |
+| `lambda_lya` | Weight for Lyapunov stability loss |
+| `stage` | Curriculum stage: `A`, `B`, `C`, `D`, `E`, `F`, or `G` |
+
+### Reproducible Small Run
+
+For a lightweight smoke test:
+
+```python
+CONFIG["train_limit"] = 50
+CONFIG["eval_limit"] = 50
+CONFIG["num_epochs"] = 1
+```
+
+### Full Evaluation
+
+For full GSM8K evaluation:
+
+```python
+CONFIG["eval_limit"] = None
+```
+
+Full 7B-scale experiments require high-memory GPU hardware. The reported project runs used an A100 80GB environment.
+
+---
+
+## 7. Method Details
+
+### 7.1 Latent Anchor
+
+LCLDD extracts a question-conditioned anchor \(\phi(x)\) from the frozen student representation. This anchor keeps recursive latent updates tied to the input question.
+
+### 7.2 Recursive Thinking Block
+
+The thinking block applies a contractive update around the anchor:
+
+\[
+h_{t+1} = \phi(x) + (1 - \gamma)(h_t - \phi(x)) + \gamma \Delta h_t
+\]
+
+where \(\gamma\) is a learnable contraction rate and \(\Delta h_t\) is a bounded correction.
+
+### 7.3 Lyapunov Energy
+
+The stability energy is:
+
+\[
+V(h_t; x) = \alpha \|h_t - \phi(x)\|_2^2 + \beta \|h_t\|_2^2
+\]
+
+The Lyapunov loss penalizes energy increases across recursive steps.
+
+### 7.4 Vector-Field Distillation
+
+The student trajectory is trained to follow the teacher's projected direction of motion:
+
+\[
+L_{vf} = \sum_t \| (h_{t+1}^S - h_t^S) - (z_{t+1}^T - z_t^T) \|_2^2
+\]
+
+This transfers teacher reasoning direction rather than only matching final states.
+
+---
+
+## 8. Training Curriculum
+
+The implementation supports a staged curriculum through `combined_loss.py`.
+
+| Stage | Active Objective | Purpose |
+|---|---|---|
+| A/B/C | Answer loss | Learn task-relevant latent injection |
+| D | Answer loss + vector-field loss | Align latent motion with teacher trajectory |
+| E | Answer loss + vector-field loss + Lyapunov loss | Stabilize recursive latent dynamics |
+| F/G | Optional Jacobian/adaptive extensions | Experimental future work |
+
+The final evaluated method uses the core stages A, D, and E. Stage E produced the strongest 500-example ablation result in the reported experiments.
+
+---
+
+## 9. Evaluation Metrics
+
+The evaluation reports:
+
+- Numeric exact-match accuracy
+- Correct/total counts
+- Average latency per example
+- Lyapunov energy trajectory
+- Energy descent indicator
+- Latent norm trajectory
+- Fixed/broken example analysis when comparing runs
+
+Answer extraction uses the final numeric value in the generated output and compares it with the normalized GSM8K gold answer.
+
+---
+
+## 10. Reproducibility Notes
+
+- Set `CONFIG["seed"]` for deterministic initialization where possible.
+- Use greedy decoding (`do_sample=False`) for deterministic evaluation.
+- Keep teacher caches, checkpoints, and results outside Git.
+- Use the same prompt format when comparing baseline and LCLDD.
+- For instruction-tuned external models, model-specific chat templates may change results.
+- Full 7B-scale runs are hardware-sensitive and may require A100-class GPU memory.
+
+---
+
+## 11. Limitations
+
+LCLDD is a research prototype. Current limitations include:
+
+- The default scripts are optimized for GSM8K-style numeric-answer evaluation.
+- Fixed injection scales can break some baseline-correct examples.
+- Stronger specialized students require smaller injection scales.
+- Teacher trajectory extraction can be expensive for large teacher models.
+- Dynamic halting and Jacobian alignment are implemented/planned as experimental extensions, but they are not the main evaluated result.
+
+---
+
+## 12. Code Availability
+
+Repository:
+
+```text
+https://github.com/KARTIKPANSURIYA/lcldd
+```
+
+---
+
+## 13. Citation
+
+If you use this project, cite it as:
+
+```bibtex
+@misc{pansuriya2026lcldd,
+  title  = {Mitigating Stochastic Drift in Small Language Models via Lyapunov-Constrained Latent Dynamics Distillation},
+  author = {Pansuriya, Kartik and Kharwa, Hena},
+  year   = {2026},
+  note   = {Research project repository},
+  url    = {https://github.com/KARTIKPANSURIYA/lcldd}
+}
+```
+
+---
+
+## 14. Acknowledgment
+
+This project was developed as part of an academic research project at Stevens Institute of Technology. The authors thank the Department of Electrical and Computer Engineering for academic support and access to computing resources, and thank Prof. Min Song for project guidance and mentorship.
