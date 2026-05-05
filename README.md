@@ -54,22 +54,28 @@ The main project experiments were run on the full **Grade School Math 8K (GSM8K)
 
 ```text
 .
-├── config.py                  # Central configuration for model, dataset, training, and paths
-├── precompute_teacher.py       # Precomputes teacher hidden-state trajectories
-├── train.py                    # Trains the LCLDD thinking block and projection head
-├── evaluate.py                 # Evaluates baseline and LCLDD generation on GSM8K
+├── config.py                    # Central configuration for models, dataset, training, and paths
+├── precompute_teacher.py         # Precomputes teacher hidden-state trajectories
+├── train.py                      # Trains the LCLDD thinking block and projection head
+├── evaluate.py                   # Evaluates baseline and LCLDD generation on GSM8K
+├── requirements.txt              # Python dependencies
+├── LICENSE                       # MIT license
+├── CITATION.cff                  # Citation metadata for GitHub and academic reuse
 ├── data/
-│   └── gsm8k_loader.py         # GSM8K loading and numeric answer extraction
+│   ├── __init__.py
+│   └── gsm8k_loader.py           # GSM8K loading and numeric answer extraction
 ├── losses/
-│   ├── combined_loss.py        # Stage-aware LCLDD loss composition
-│   ├── lyapunov_loss.py        # Lyapunov energy descent penalty
-│   └── vf_loss.py              # Vector-field distillation loss
-├── models/
-│   ├── thinking_block.py       # Contractive Lyapunov thinking block
-│   ├── projection_head.py      # Bounded projection head for latent injection
-│   └── halting.py              # Experimental dynamic halting module
-├── requirements.txt
-└── README.md
+│   ├── combined_loss.py          # Stage-aware LCLDD loss composition
+│   ├── lyapunov_loss.py          # Lyapunov energy descent penalty
+│   ├── vf_loss.py                # Vector-field distillation loss used by the main training script
+│   └── jac_loss.py               # Optional Stage F/G Jacobian alignment loss
+└── models/
+    ├── thinking_block.py         # Contractive Lyapunov thinking block
+    ├── projection_head.py        # Bounded projection head for latent injection
+    ├── load_models.py            # Frozen teacher/student loading helpers
+    ├── vector_field.py           # Reusable vector-field utility module
+    ├── jacobian_alignment.py     # Optional Jacobian alignment utility module
+    └── halting.py                # Experimental dynamic halting module
 ```
 
 Generated files are intentionally ignored by Git:
@@ -81,7 +87,7 @@ results/
 wandb/
 ```
 
-This keeps the repository lightweight and avoids committing large model caches or experiment outputs.
+This keeps the repository lightweight and avoids committing large model caches, checkpoints, or experiment outputs.
 
 ---
 
